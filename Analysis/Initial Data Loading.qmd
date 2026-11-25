@@ -1,0 +1,190 @@
+---
+title: "Initial data retrieval"
+format: html
+---
+
+## 1. Download
+
+`kagglehub` downloads once and caches under `~/.cache/kagglehub`; later runs just return the path.
+
+```{python}
+import kagglehub
+
+path = kagglehub.dataset_download("mkhoirulmustaqim/student-depression-detection-dataset")
+print("Path to dataset files:", path)
+```
+
+## 2. Load into pandas
+
+The CSV sits in a subfolder, so `rglob` finds it wherever it is. A `DataFrame` (`df`) is a table: rows = students, columns = variables.
+
+```{python}
+from pathlib import Path
+import pandas as pd
+
+csv_path = next(Path(path).rglob("*.csv"))
+df = pd.read_csv(csv_path)
+df.head()          # first 5 rows
+```
+
+## 3. First look
+
+```{python}
+df.shape           # (rows, columns) -- an attribute, so no ()
+```
+
+```{python}
+df.info()          # column names, types, non-null counts
+```
+
+```{python}
+df.isna().sum()    # missing values per column
+```
+
+```{python}
+df.duplicated().sum()   # fully duplicated rows
+```
+
+## 4. Numeric columns
+
+```{python}
+df.describe()      # count / mean / std / min / quartiles / max
+```
+
+```{python}
+import matplotlib.pyplot as plt
+import seaborn as sns
+
+df.hist(figsize=(10, 6), bins=20)
+plt.tight_layout()
+```
+
+## 5. Categorical columns
+
+`value_counts()` is the categorical equivalent of `describe()`.
+
+```{python}
+categorical = df.select_dtypes(exclude="number").columns
+for col in categorical:
+    print(df[col].value_counts(), "\n")
+```
+
+## 6. The target: Depression
+
+```{python}
+df["Depression"].value_counts(normalize=True)   # proportions, not counts
+```
+
+Depression rate within each category. `groupby` splits rows by a column; `.mean()` on a True/False column gives the share that are True.
+
+```{python}
+df["depressed"] = df["Depression"].eq("Yes")
+
+for col in categorical.drop("Depression"):
+    print(df.groupby(col)["depressed"].mean().sort_values(ascending=False).round(2), "\n")
+```
+
+Numeric columns split by the target:
+
+```{python}
+numeric = df.select_dtypes("number").columns
+fig, axes = plt.subplots(1, len(numeric), figsize=(14, 4))
+for ax, col in zip(axes, numeric):
+    sns.boxplot(data=df, x="Depression", y=col, ax=ax)
+plt.tight_layout()
+```
+
+## 7. FAMD (Factor Analysis of Mixed Data)
+
+FAMD is PCA for tables with both numeric and categorical columns: it standardises the numeric columns, one-hot encodes the categorical ones (weighted the way MCA weights them), and then finds the axes with the most variance.
+
+The `Depression` target is **left out** of the fit, so the axes are built only from the predictors. Afterwards we colour each point by Depression to see whether cases and controls end up in different places.
+
+`prince` treats every non-float column as categorical, so the integer columns have to be cast to float first. Otherwise Age, Cost, etc. become hundreds of dummy columns.
+
+```{python}
+import prince
+
+X = df.drop(columns=["Depression", "depressed"])
+X[numeric] = X[numeric].astype(float)
+
+famd = prince.FAMD(n_components=5, random_state=0).fit(X)
+famd.eigenvalues_summary
+```
+
+```{python}
+coords = famd.row_coordinates(X)        # one row per student
+loadings = famd.column_coordinates_     # one row per numeric variable / category level
+contrib = famd.column_contributions_    # share of each axis's variance from each variable
+pct = famd.percentage_of_variance_      # % variance per component
+```
+
+Scree plot: how much variance each component explains.
+
+```{python}
+fig, ax = plt.subplots(figsize=(6, 3))
+ax.bar([f"Dim {i+1}" for i in range(len(pct))], pct, color="#2a78d6")
+ax.set_ylabel("% of variance")
+sns.despine()
+```
+
+Variables that contribute most to dimensions 1 and 2:
+
+```{python}
+top = (contrib[0] * pct[0] + contrib[1] * pct[1]).sort_values(ascending=False)
+top.head(12).round(3)
+```
+
+### Biplot: students coloured by Depression, with loadings
+
+The points are students, coloured by case/control. The arrows are loadings: numeric variables point the way the variable increases, and category levels point toward the students who have that level. Only the 12 strongest contributors are drawn so the plot stays readable. Loadings are on a different scale from the student scores, so the arrows are stretched to fit (only their direction and relative length mean anything).
+
+```{python}
+colours = {"No": "#2a78d6", "Yes": "#eb6834"}
+labels = {"No": "Control", "Yes": "Depression"}
+
+fig, ax = plt.subplots(figsize=(9, 8))
+for status, colour in colours.items():
+    pts = coords[df["Depression"] == status]
+    ax.scatter(pts[0], pts[1], s=10, alpha=0.35, color=colour, label=labels[status], linewidths=0)
+    ax.scatter(pts[0].mean(), pts[1].mean(), s=160, color=colour, edgecolor="white", linewidth=2, zorder=5)
+
+L = loadings.loc[top.head(12).index, [0, 1]]
+scale = 0.8 * coords[[0, 1]].abs().max().max() / L.abs().max().max()
+for x, y in L.values:
+    ax.arrow(0, 0, x * scale, y * scale, color="#52514e", width=0.01, head_width=0.08,
+             length_includes_head=True, zorder=6)
+
+# "Family_background_Rich class" -> "Family background: Rich class"
+pretty = {n: n.replace("_", " ") for n in L.index}
+for col in categorical:
+    for n in L.index:
+        if n.startswith(col + "_"):
+            pretty[n] = f"{col.replace('_', ' ')}: {n[len(col) + 1:]}"
+
+# ponytail: crude label de-overlap (push up if too close); use adjustText if it gets crowded
+placed = []
+for name, (x, y) in sorted(L.iterrows(), key=lambda r: r[1][1]):
+    lx, ly = x * scale * 1.12, y * scale * 1.12
+    for px, py in placed:
+        if abs(lx - px) < 1.5 and ly - py < 0.3:
+            ly = py + 0.3
+    placed.append((lx, ly))
+    ax.text(lx, ly, pretty[name], fontsize=8, color="#0b0b0b", ha="center", va="center", zorder=7,
+            bbox=dict(boxstyle="round,pad=0.15", fc="white", ec="none", alpha=0.8))
+
+ax.axhline(0, color="#d0d0cc", lw=0.8, zorder=0)
+ax.axvline(0, color="#d0d0cc", lw=0.8, zorder=0)
+ax.set_xlabel(f"Dim 1 ({pct[0]:.1f}%)")
+ax.set_ylabel(f"Dim 2 ({pct[1]:.1f}%)")
+leg = ax.legend(title="Large dots = group mean", frameon=False, markerscale=2, loc="upper left")
+for h in leg.legend_handles:
+    h.set_alpha(1)
+sns.despine()
+```
+
+How far apart are cases and controls on each component? Mean score per group:
+
+```{python}
+coords.groupby(df["Depression"]).mean().round(2)
+```
